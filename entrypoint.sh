@@ -106,16 +106,20 @@ if [ "$SFT_WARMSTART" = "true" ]; then
     WARMSTART_FLAG="--sft-warmstart"
 fi
 
-# Find frozen AA adapter for MM training
+# Find frozen AA adapter for MM training (check RL adapters first, then SFT)
 FROZEN_AA_FLAG=""
 for p in "$PROJECT_DIR/models/memory-r1-rl/adapter_answer_agent_rl/best" \
-         "$PROJECT_DIR/models/memory-r1-rl/adapter_answer_agent_rl/final"; do
+         "$PROJECT_DIR/models/memory-r1-rl/adapter_answer_agent_rl/final" \
+         "$PROJECT_DIR/models/adapter_answer_agent"; do
     if [ -d "$p" ]; then
         FROZEN_AA_FLAG="--frozen-aa-path $p"
         echo "Frozen AA: $p"
         break
     fi
 done
+if [ -z "$FROZEN_AA_FLAG" ]; then
+    echo "No frozen AA adapter found — using base model as AA"
+fi
 
 # ---- Run training ----
 echo ""

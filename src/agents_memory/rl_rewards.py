@@ -189,15 +189,31 @@ class MMRewardComputer:
 
     def _run_frozen_aa(self, memories: list[dict], question: str) -> str:
         """Run frozen AA on a single QA pair with given memories."""
-        memory_text = "\n".join(
-            f"- [{m.get('id', '?')}]: {m.get('text', '')}" for m in memories
-        )
-        prompt = (
-            "You are answering a question about a conversation between two people, "
-            "using retrieved memories.\n\n"
-            f"## Retrieved Memories\n{memory_text}\n\n"
-            f"## Question\n{question}\n\n"
-            "**Answer:**"
+        from agents_memory.prompts_r1 import ANSWER_AGENT_PROMPT
+
+        # Format memories — group by speaker if available, else flat list
+        by_speaker: dict[str, list[dict]] = {}
+        for m in memories:
+            speaker = m.get("speaker", "Unknown")
+            by_speaker.setdefault(speaker, []).append(m)
+
+        memory_lines = []
+        if len(by_speaker) == 1 and "Unknown" in by_speaker:
+            # No speaker info — flat list
+            memory_lines.append("\nMemories:")
+            for mem in memories:
+                memory_lines.append(f"- {mem.get('text', '')}")
+        else:
+            for speaker in sorted(by_speaker):
+                memory_lines.append(f"\nMemories for user {speaker}:")
+                for mem in by_speaker[speaker]:
+                    timestamp = mem.get("timestamp", "")
+                    prefix = f"{timestamp}: " if timestamp else ""
+                    memory_lines.append(f"- {prefix}{mem.get('text', '')}")
+
+        prompt = ANSWER_AGENT_PROMPT.format(
+            memories="\n".join(memory_lines) if memory_lines else "No memories available.",
+            question=question,
         )
         messages = [{"role": "user", "content": prompt}]
         input_text = self.tokenizer.apply_chat_template(
