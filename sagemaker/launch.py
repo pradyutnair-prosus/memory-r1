@@ -155,6 +155,7 @@ def launch_train(
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
     spot: bool = False,
     max_run_hours: int = 24,
+    **kwargs,  # Workshop params: budget_lambda, budget_target, reward, sft_warmstart, order
 ) -> str:
     """Launch training job. Supports chaining via prep and prev channels."""
     job_name = f"memory-r1-{phase.replace('_', '-')}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -167,10 +168,18 @@ def launch_train(
         "SM_HP_BASE_MODEL": BASE_MODEL,
     }
 
+    # Workshop experiment params (passed via kwargs)
+    for key in ["budget_lambda", "budget_target", "reward", "sft_warmstart", "order"]:
+        val = kwargs.get(key)
+        if val is not None:
+            hyperparameters[f"SM_HP_{key.upper()}"] = str(val)
+
     environment = {
         "TOKENIZERS_PARALLELISM": "false",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     }
+    # Also pass as env vars for entrypoint
+    environment.update(hyperparameters)
 
     stopping = {"MaxRuntimeInSeconds": max_run_hours * 3600}
     if spot:
@@ -303,14 +312,14 @@ Example:
     train_parser = subparsers.add_parser("train", help="Run training phase")
     train_parser.add_argument(
         "--phase",
-        choices=["rl_mm", "rl_aa", "eval", "all"],
+        choices=["mm", "aa", "both", "eval"],
         required=True,
     )
     train_parser.add_argument("--instance", default=TRAIN_INSTANCE)
-    train_parser.add_argument("--prep-s3", default="", help="S3 path to prep output (model weights)")
-    train_parser.add_argument("--prep-job", default="", help="Prep job name (resolves S3 path)")
-    train_parser.add_argument("--prev-s3", default="", help="S3 path to previous job output (adapters)")
-    train_parser.add_argument("--prev-job", default="", help="Previous job name (resolves S3 path)")
+    train_parser.add_argument("--prep-s3", default="")
+    train_parser.add_argument("--prep-job", default="")
+    train_parser.add_argument("--prev-s3", default="")
+    train_parser.add_argument("--prev-job", default="")
     train_parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     train_parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
     train_parser.add_argument("--checkpoint-every", type=int, default=DEFAULT_CHECKPOINT_EVERY)
@@ -318,6 +327,12 @@ Example:
     train_parser.add_argument("--wait", action="store_true")
     train_parser.add_argument("--max-run-hours", type=int, default=24)
     train_parser.add_argument("--dry-run", action="store_true")
+    # Workshop extensions
+    train_parser.add_argument("--budget-lambda", type=float, default=0.0)
+    train_parser.add_argument("--budget-target", type=int, default=50)
+    train_parser.add_argument("--reward", choices=["em", "f1"], default="em")
+    train_parser.add_argument("--sft-warmstart", action="store_true")
+    train_parser.add_argument("--order", choices=["mm-aa", "aa-mm"], default="mm-aa")
 
     args = parser.parse_args()
     profile = "884058771994_SageMakerModelTrainingRole"
@@ -362,6 +377,11 @@ Example:
             checkpoint_every=args.checkpoint_every,
             spot=args.spot,
             max_run_hours=args.max_run_hours,
+            budget_lambda=args.budget_lambda,
+            budget_target=args.budget_target,
+            reward=args.reward,
+            sft_warmstart="true" if args.sft_warmstart else "false",
+            order=args.order,
         )
 
         print(f"\nJob: {job_name}")
