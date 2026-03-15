@@ -24,6 +24,7 @@ from pathlib import Path
 
 import torch
 from datasets import Dataset
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
@@ -59,8 +60,14 @@ MAX_SEQ_LENGTH = 4096             # Paper: max prompt length = 4096
 PER_DEVICE_BATCH_SIZE = 2         # Paper: micro-batch = 2 per GPU
 GRADIENT_ACCUMULATION = 16        # With 4 GPUs (g5.12xlarge): 2 * 4 * 16 = 128 effective batch
 
-# Paper uses full fine-tuning (no LoRA). DeepSpeed ZeRO-3 + CPU offload for memory.
-DEEPSPEED_CONFIG = str(Path(__file__).parent.parent / "sagemaker" / "ds_zero3_offload.json")
+# LoRA config (needed for A10G 24GB — full FT requires H100/A100)
+LORA_R = 64
+LORA_ALPHA = 64
+LORA_DROPOUT = 0.05
+LORA_TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -195,52 +202,65 @@ def detect_device() -> tuple[str, torch.dtype]:
 
 def setup_model_for_grpo(
     model_name: str,
+    sft_adapter_path: str | None = None,
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer, str]:
-    """Load base model in full bf16 for full fine-tuning. No LoRA (paper doesn't use it).
+    """Load base model with LoRA for GRPO training on A10G GPUs.
 
-    DeepSpeed ZeRO-3 handles memory sharding across GPUs.
-    Don't set device_map — DeepSpeed manages device placement.
+    With LoRA, the base model is shared between policy and reference (no extra copy).
     """
     device, dtype = detect_device()
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=dtype, trust_remote_code=True,
+        model_name, torch_dtype=dtype, trust_remote_code=True, device_map="auto",
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"  Full fine-tuning: {trainable:,} / {total:,} params (100%)")
+    lora_config = LoraConfig(
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        target_modules=LORA_TARGET_MODULES,
+        task_type=TaskType.CAUSAL_LM,
+        bias="none",
+    )
+    model = get_peft_model(model, lora_config)
+
+    if sft_adapter_path and Path(sft_adapter_path).exists():
+        print(f"  Loading SFT adapter from: {sft_adapter_path}")
+        model.load_adapter(sft_adapter_path, "default")
+
+    trainable, total = model.get_nb_trainable_parameters()
+    print(f"  LoRA params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
     return model, tokenizer, device
 
 
 def load_frozen_aa(
     model_name: str,
-    trained_model_path: str | None = None,
+    aa_adapter_path: str | None = None,
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     """Load frozen Answer Agent for MM reward computation.
 
-    If trained_model_path is provided, loads the full fine-tuned model.
-    Otherwise loads the base model (for Phase 1: MM training with base AA).
+    Loads base model + optional LoRA adapter, merged and frozen.
+    If no adapter, uses base model (for Phase 1: MM training with base AA).
     """
     device, dtype = detect_device()
 
-    load_path = trained_model_path if trained_model_path else model_name
-    print(f"  Loading frozen AA from: {load_path}")
-
     model = AutoModelForCausalLM.from_pretrained(
-        load_path, torch_dtype=dtype, trust_remote_code=True, device_map="auto",
+        model_name, torch_dtype=dtype, trust_remote_code=True, device_map="auto",
     )
-    tokenizer = AutoTokenizer.from_pretrained(
-        trained_model_path or model_name, trust_remote_code=True,
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+
+    if aa_adapter_path and Path(aa_adapter_path).exists():
+        print(f"  Loading AA adapter: {aa_adapter_path}")
+        model = PeftModel.from_pretrained(model, aa_adapter_path)
+        model = model.merge_and_unload()
 
     model.eval()
     for param in model.parameters():
@@ -276,18 +296,26 @@ def aa_f1_reward(completions: list[str], gold_answer: list[str], **kwargs) -> li
 # ---------------------------------------------------------------------------
 
 def train_aa(args: argparse.Namespace) -> Path:
-    """Phase 1: Train Answer Agent with GRPO. Reward = pure EM (Paper Eq. 4)."""
+    """Train Answer Agent with GRPO. Reward = EM (or F1 if configured)."""
     print("\n" + "=" * 60)
-    print("PHASE 1: Answer Agent GRPO Training")
+    print("Answer Agent GRPO Training")
     print("=" * 60)
 
     output_dir = OUTPUT_DIR / "memory-r1-rl" / "adapter_answer_agent_rl"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # No SFT warmstart — paper starts RL from base model directly
-    model, tokenizer, device = setup_model_for_grpo(args.base_model)
+    # Optional SFT warmstart (workshop extension: SFT→RL ablation)
+    sft_path = None
+    if args.sft_warmstart:
+        sft_path = str(OUTPUT_DIR / "adapter_answer_agent")
+        if not Path(sft_path).exists():
+            print(f"  WARNING: SFT adapter not found at {sft_path}, starting from base model")
+            sft_path = None
+        else:
+            print(f"  Using SFT warmstart from: {sft_path}")
 
-    # Load data
+    model, tokenizer, device = setup_model_for_grpo(args.base_model, sft_adapter_path=sft_path)
+
     train_path = DATA_DIR / "answer_agent_train.jsonl"
     train_dataset = load_rl_dataset_aa(train_path, tokenizer, MAX_SEQ_LENGTH)
     print(f"  Training examples: {len(train_dataset)}")
@@ -299,7 +327,7 @@ def train_aa(args: argparse.Namespace) -> Path:
         val_data = list(val_data)
         print(f"  Validation examples: {len(val_data)}")
 
-    # GRPO config (Paper Appendix D) with DeepSpeed ZeRO-3 for full fine-tuning
+    # GRPO config — LoRA on A10G, no DeepSpeed needed
     grpo_config = GRPOConfig(
         output_dir=str(output_dir / "trainer_output"),
         num_generations=GRPO_GROUP_SIZE,
@@ -316,10 +344,17 @@ def train_aa(args: argparse.Namespace) -> Path:
         gradient_checkpointing=True,
         remove_unused_columns=False,
         report_to="none",
-        deepspeed=DEEPSPEED_CONFIG,
-        lr_scheduler_type="constant",  # Paper Appendix D: "constant warmup schedule"
+        lr_scheduler_type="constant",
         warmup_steps=0,
     )
+
+    # Select reward function
+    reward_fn = aa_em_reward
+    if args.reward == "f1":
+        reward_fn = aa_f1_reward
+        print("  Reward: F1 (workshop extension)")
+    else:
+        print("  Reward: EM (paper default)")
 
     metrics_callback = MemoryR1MetricsCallback(
         metrics_path=output_dir / "metrics.jsonl",
@@ -335,48 +370,58 @@ def train_aa(args: argparse.Namespace) -> Path:
         model=model,
         args=grpo_config,
         train_dataset=train_dataset,
-        reward_funcs=[aa_em_reward],
+        reward_funcs=[reward_fn],
         processing_class=tokenizer,
         callbacks=[metrics_callback],
     )
 
-    print("\nStarting AA GRPO training (full fine-tuning, DeepSpeed ZeRO-3)...")
+    print(f"\nStarting AA GRPO (LoRA, {args.reward} reward)...")
     trainer.train()
 
-    # Save full model (not adapter)
     final_dir = output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-    trainer.save_model(str(final_dir))
+    model.save_pretrained(str(final_dir))
     tokenizer.save_pretrained(str(final_dir))
-    print(f"\nFinal AA model saved to {final_dir}")
+    print(f"\nFinal AA adapter saved to {final_dir}")
 
     return output_dir
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Memory Manager GRPO
+# Memory Manager GRPO
 # ---------------------------------------------------------------------------
 
 def train_mm(args: argparse.Namespace) -> Path:
-    """Phase 2: Train Memory Manager with GRPO. Reward = indirect EM via frozen AA."""
+    """Train Memory Manager with GRPO. Reward = indirect EM via frozen AA.
+
+    Workshop extension: optional memory budget penalty.
+    """
     print("\n" + "=" * 60)
-    print("PHASE 1: Memory Manager GRPO Training (paper trains MM first)")
+    print("Memory Manager GRPO Training")
     print("=" * 60)
 
-    output_dir = OUTPUT_DIR / "memory-r1-rl" / "memory_manager_rl"
+    output_dir = OUTPUT_DIR / "memory-r1-rl" / "adapter_memory_manager_rl"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load frozen AA — paper uses base (untrained) AA for Phase 1
+    # Load frozen AA
     frozen_aa_path = args.frozen_aa_path
-    frozen_aa, tokenizer = load_frozen_aa(
-        args.base_model,
-        trained_model_path=frozen_aa_path,  # None = base model
-    )
+    if frozen_aa_path and Path(frozen_aa_path).exists():
+        print(f"  Frozen AA from: {frozen_aa_path}")
+    else:
+        frozen_aa_path = None
+        print("  Frozen AA: base model (untrained)")
 
-    # Setup MM model — no SFT warmstart, train from base model
-    model, tokenizer, device = setup_model_for_grpo(args.base_model)
+    frozen_aa, tokenizer = load_frozen_aa(args.base_model, aa_adapter_path=frozen_aa_path)
 
-    # Load data
+    # Optional SFT warmstart
+    sft_path = None
+    if args.sft_warmstart:
+        sft_path = str(OUTPUT_DIR / "adapter_memory_manager")
+        if not Path(sft_path).exists():
+            sft_path = None
+
+    model, tokenizer, device = setup_model_for_grpo(args.base_model, sft_adapter_path=sft_path)
+
     train_path = DATA_DIR / "memory_manager_train.jsonl"
     train_dataset = load_rl_dataset_mm(train_path, tokenizer, MAX_SEQ_LENGTH)
     print(f"  Training examples: {len(train_dataset)}")
@@ -388,7 +433,6 @@ def train_mm(args: argparse.Namespace) -> Path:
         val_data = list(val_data)
         print(f"  Validation examples: {len(val_data)}")
 
-    # GRPO config with DeepSpeed ZeRO-3
     grpo_config = GRPOConfig(
         output_dir=str(output_dir / "trainer_output"),
         num_generations=GRPO_GROUP_SIZE,
@@ -405,17 +449,23 @@ def train_mm(args: argparse.Namespace) -> Path:
         gradient_checkpointing=True,
         remove_unused_columns=False,
         report_to="none",
-        deepspeed=DEEPSPEED_CONFIG,
-        lr_scheduler_type="constant",  # Paper Appendix D: "constant warmup schedule"
+        lr_scheduler_type="constant",
         warmup_steps=0,
     )
 
+    # Memory budget reward (workshop extension)
     mm_reward = MMRewardComputer(
         frozen_aa_model=frozen_aa,
         tokenizer=tokenizer,
         max_new_tokens=MAX_COMPLETION_TOKENS_AA,
         device=device,
+        budget_lambda=args.budget_lambda,
+        budget_target=args.budget_target,
     )
+    if args.budget_lambda > 0:
+        print(f"  Budget penalty: λ={args.budget_lambda}, target={args.budget_target} memories")
+    else:
+        print("  Reward: EM only (no budget penalty)")
 
     eval_fn = None
     eval_kwargs = {}
@@ -442,14 +492,14 @@ def train_mm(args: argparse.Namespace) -> Path:
         callbacks=[metrics_callback],
     )
 
-    print("\nStarting MM GRPO training (full fine-tuning, DeepSpeed ZeRO-3)...")
+    print(f"\nStarting MM GRPO (LoRA, budget_λ={args.budget_lambda})...")
     trainer.train()
 
     final_dir = output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-    trainer.save_model(str(final_dir))
+    model.save_pretrained(str(final_dir))
     tokenizer.save_pretrained(str(final_dir))
-    print(f"\nFinal MM model saved to {final_dir}")
+    print(f"\nFinal MM adapter saved to {final_dir}")
 
     return output_dir
 
@@ -460,7 +510,7 @@ def train_mm(args: argparse.Namespace) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Memory-R1 GRPO Training with Metrics Tracking"
+        description="Memory-R1 GRPO Training — Workshop Extension (LoRA on A10G)"
     )
     parser.add_argument(
         "--phase", choices=["aa", "mm", "both"], required=True,
@@ -468,23 +518,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--base-model", default=DEFAULT_BASE_MODEL,
-        help=f"Base model name or path (default: {DEFAULT_BASE_MODEL})",
     )
     parser.add_argument(
         "--frozen-aa-path", default=None,
-        help="Path to frozen AA adapter for MM training (default: auto from Phase 1)",
+        help="Path to frozen AA adapter for MM training",
+    )
+    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--eval-every", type=int, default=50)
+    parser.add_argument("--checkpoint-every", type=int, default=100)
+
+    # Workshop extensions
+    parser.add_argument(
+        "--sft-warmstart", action="store_true",
+        help="Initialize RL from SFT adapter instead of base model",
     )
     parser.add_argument(
-        "--max-steps", type=int, default=200,
-        help="Maximum training steps (default: 200, per Paper Figure 7)",
+        "--reward", choices=["em", "f1"], default="em",
+        help="AA reward function: em (paper default) or f1 (workshop extension)",
     )
     parser.add_argument(
-        "--eval-every", type=int, default=50,
-        help="Run validation every N steps (default: 50)",
+        "--budget-lambda", type=float, default=0.0,
+        help="Memory budget penalty weight (0 = off, >0 = penalize large banks)",
     )
     parser.add_argument(
-        "--checkpoint-every", type=int, default=100,
-        help="Save checkpoint every N steps (default: 100)",
+        "--budget-target", type=int, default=50,
+        help="Target memory bank size for budget penalty normalization",
+    )
+    parser.add_argument(
+        "--order", choices=["mm-aa", "aa-mm"], default="mm-aa",
+        help="Training order for --phase both (mm-aa = paper default)",
     )
     return parser.parse_args()
 
@@ -492,25 +554,30 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    print("Memory-R1 GRPO Training")
+    print("Memory-R1 GRPO Training (Workshop Branch)")
     print(f"  Phase: {args.phase}")
     print(f"  Base model: {args.base_model}")
     print(f"  Max steps: {args.max_steps}")
-    print(f"  Eval every: {args.eval_every} steps")
-    print(f"  Checkpoint every: {args.checkpoint_every} steps")
+    print(f"  SFT warmstart: {args.sft_warmstart}")
+    print(f"  AA reward: {args.reward}")
+    print(f"  Budget λ: {args.budget_lambda}")
+    print(f"  Training order: {args.order}")
     print(f"  Output: {OUTPUT_DIR}")
-    print(f"  Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
     if torch.cuda.is_available():
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print()
 
-    # Paper order: MM first (frozen base AA), then AA (frozen trained MM)
-    if args.phase in ("mm", "both"):
-        mm_output = train_mm(args)
-        print(f"\nMM training complete. Output: {mm_output}")
-
-    if args.phase in ("aa", "both"):
+    if args.phase == "both":
+        if args.order == "mm-aa":
+            train_mm(args)
+            train_aa(args)
+        else:
+            train_aa(args)
+            train_mm(args)
+    elif args.phase == "mm":
+        train_mm(args)
+    elif args.phase == "aa":
         train_aa(args)
 
     print("\nAll training complete.")

@@ -161,6 +161,12 @@ class MMRewardComputer:
 
     Holds a frozen AA. For each MM completion:
     1. Parse JSON ops -> apply to memory bank -> run frozen AA -> average EM = reward
+
+    Supports memory budget penalty (workshop extension):
+        reward = accuracy_reward - budget_lambda * (bank_size / budget_target)
+
+    When budget_lambda > 0, the agent is incentivized to keep the memory bank small
+    by using DELETE operations strategically.
     """
 
     def __init__(
@@ -169,6 +175,8 @@ class MMRewardComputer:
         tokenizer: AutoTokenizer,
         max_new_tokens: int = 2048,
         device: str | None = None,
+        budget_lambda: float = 0.0,
+        budget_target: int = 50,
     ):
         self.frozen_aa = frozen_aa_model
         self.tokenizer = tokenizer
@@ -176,6 +184,8 @@ class MMRewardComputer:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.frozen_aa.eval()
         self.__name__ = "mm_reward"
+        self.budget_lambda = budget_lambda
+        self.budget_target = budget_target
 
     def _run_frozen_aa(self, memories: list[dict], question: str) -> str:
         """Run frozen AA on a single QA pair with given memories."""
@@ -245,6 +255,16 @@ class MMRewardComputer:
                 answer = extract_answer_from_completion(predicted)
                 em_scores.append(compute_em(answer, gold))
 
-            rewards.append(sum(em_scores) / len(em_scores))
+            accuracy_reward = sum(em_scores) / len(em_scores)
+
+            # Memory budget penalty: penalize large memory banks
+            if self.budget_lambda > 0:
+                bank_size = len(updated_bank)
+                budget_penalty = self.budget_lambda * (bank_size / self.budget_target)
+                reward = max(0.0, accuracy_reward - budget_penalty)
+            else:
+                reward = accuracy_reward
+
+            rewards.append(reward)
 
         return rewards
